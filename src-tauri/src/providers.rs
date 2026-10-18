@@ -1,7 +1,8 @@
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::time::sleep;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -132,6 +133,60 @@ pub fn http_error(provider: &str, status: u16, body: &str) -> String {
     }
 }
 
+const MAX_ATTEMPTS: usize = 3;
+const MAX_BACKOFF_SECS: u64 = 30;
+
+fn retryable_status(status: StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
+}
+
+fn parse_retry_after(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().map(|s| s.min(MAX_BACKOFF_SECS))
+}
+
+/// Send with backoff on 429/5xx and connect errors, honoring the `Retry-After`
+/// seconds form. Returns the final response; the caller formats the error from
+/// its body. Only a non-retryable status or the last attempt exits early.
+async fn send_with_retry(http: &Client, req: &Request, name: &str) -> Result<Response, String> {
+    let mut delay = 1u64;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let cloned = match req.try_clone() {
+            Some(c) => c,
+            None => return Err(format!("{name}: cannot clone request")),
+        };
+        match http.execute(cloned).await {
+            Ok(resp) => {
+                if !retryable_status(resp.status()) || attempt == MAX_ATTEMPTS {
+                    return Ok(resp);
+                }
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after)
+                    .unwrap_or(delay);
+                log::warn!(
+                    "{name} HTTP {} — retry in {wait}s (attempt {attempt}/{MAX_ATTEMPTS})",
+                    resp.status().as_u16()
+                );
+                sleep(Duration::from_secs(wait)).await;
+                delay = (delay * 2).min(MAX_BACKOFF_SECS);
+            }
+            Err(e) => {
+                if attempt == MAX_ATTEMPTS || !e.is_connect() {
+                    return Err(format!("{name} request failed: {e}"));
+                }
+                log::warn!(
+                    "{name} connect error — retry in {delay}s (attempt {attempt}/{MAX_ATTEMPTS})"
+                );
+                sleep(Duration::from_secs(delay)).await;
+                delay = (delay * 2).min(MAX_BACKOFF_SECS);
+            }
+        }
+    }
+    Err(format!("{name}: retry loop exhausted"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +229,54 @@ Result"), "Result");
         assert_eq!(find_provider("anthropic").map(|p| p.kind), Some(Kind::Anthropic));
         assert!(find_provider("ollama").is_none()); // not a preset; custom providers cover it
         assert!(find_provider("nope").is_none());
+    }
+
+    #[test]
+    fn retryable_statuses() {
+        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!retryable_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn retry_after_seconds_capped() {
+        assert_eq!(parse_retry_after("7"), Some(7));
+        assert_eq!(parse_retry_after(" 12 "), Some(12));
+        assert_eq!(parse_retry_after("9999"), Some(MAX_BACKOFF_SECS));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2025 07:28:00 GMT"), None); // date form not parsed
+    }
+
+    #[tokio::test]
+    async fn retry_loop_recovers_after_two_429s() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await.unwrap_or(0); // drain request headers
+                let resp = if i < 2 {
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                };
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let req = Request::new(reqwest::Method::POST, url);
+        let resp = send_with_retry(&client(), &req, "mock").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+        server.await.unwrap();
     }
 }
 
@@ -226,13 +329,13 @@ where
     if let Some(t) = r.temperature {
         body["temperature"] = json!(t);
     }
-    let resp = http
+    let req = http
         .post(format!("{}/chat/completions", r.base_url))
         .bearer_auth(&r.api_key)
         .json(&body)
-        .send()
-        .await
+        .build()
         .map_err(|e| format!("{} request failed: {}", r.name, e))?;
+    let resp = send_with_retry(http, &req, &r.name).await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -299,14 +402,14 @@ where
     if let Some(t) = r.temperature {
         body["temperature"] = json!(t);
     }
-    let resp = http
+    let req = http
         .post(format!("{}/messages", r.base_url))
         .header("x-api-key", &r.api_key)
         .header("anthropic-version", "2023-06-01")
         .json(&body)
-        .send()
-        .await
+        .build()
         .map_err(|e| format!("{} request failed: {}", r.name, e))?;
+    let resp = send_with_retry(http, &req, &r.name).await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -368,16 +471,16 @@ where
     if let Some(t) = r.temperature {
         body["generationConfig"] = json!({"temperature": t});
     }
-    let resp = http
+    let req = http
         .post(format!(
             "{}/models/{}:streamGenerateContent?alt=sse",
             r.base_url, r.model
         ))
         .header("x-goog-api-key", &r.api_key)
         .json(&body)
-        .send()
-        .await
+        .build()
         .map_err(|e| format!("{} request failed: {}", r.name, e))?;
+    let resp = send_with_retry(http, &req, &r.name).await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -442,12 +545,12 @@ where
     if let Some(t) = r.temperature {
         body["options"] = json!({"temperature": t});
     }
-    let resp = http
+    let req = http
         .post(format!("{}/api/generate", r.base_url))
         .json(&body)
-        .send()
-        .await
+        .build()
         .map_err(|e| format!("{} request failed: {}", r.name, e))?;
+    let resp = send_with_retry(http, &req, &r.name).await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -502,7 +605,8 @@ pub async fn list_models(r: &Resolved) -> Result<Vec<String>, String> {
         Kind::Gemini => req = req.header("x-goog-api-key", &r.api_key),
         Kind::Ollama => {}
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let req = req.build().map_err(|e| e.to_string())?;
+    let resp = send_with_retry(&http, &req, &r.name).await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {

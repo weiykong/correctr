@@ -173,7 +173,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     for lang in &cfg.languages {
         let item = MenuItem::with_id(
             app,
-            &format!("translate:{lang}"),
+            format!("translate:{lang}"),
             format!("To {lang}"),
             true,
             None::<&str>,
@@ -194,7 +194,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     for skill in &cfg.skills {
         skills.append(&MenuItem::with_id(
             app,
-            &format!("skill:{}", skill.id),
+            format!("skill:{}", skill.id),
             &skill.name,
             true,
             None::<&str>,
@@ -491,21 +491,23 @@ fn write_clipboard(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
              changeCount {before} -> {after}, readback chars={:?})",
             pasteboard::get_text().map(|t| t.chars().count())
         );
-        return Err(match plugin_err {
+        Err(match plugin_err {
             Some(e) => format!("Could not write the clipboard: {e}"),
             None => "Could not write the clipboard (NSPasteboard refused)".to_string(),
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
     Err(plugin_err.unwrap_or_else(|| "clipboard write unverified".to_string()))
 }
 
-fn push_undo(state: &State<'_, AppState>, text: &str) {
-    let mut stack = state.undo_stack.lock().unwrap();
+const UNDO_LIMIT: usize = 20;
+
+fn push_undo(stack: &Mutex<Vec<String>>, text: &str) {
+    let mut stack = stack.lock().unwrap();
     if stack.last().map(String::as_str) != Some(text) {
         stack.push(text.to_string());
-        if stack.len() > 20 {
+        if stack.len() > UNDO_LIMIT {
             stack.remove(0);
         }
     }
@@ -812,7 +814,7 @@ fn prompt_accessibility() -> bool {
     unsafe {
         let key = CFStringCreateWithCString(
             std::ptr::null(),
-            b"AXTrustedCheckOptionPrompt\0".as_ptr() as *const c_char,
+            c"AXTrustedCheckOptionPrompt".as_ptr(),
             UTF8,
         );
         if key.is_null() {
@@ -828,7 +830,7 @@ fn prompt_accessibility() -> bool {
             &kCFTypeDictionaryKeyCallBacks as *const u8 as *const c_void,
             &kCFTypeDictionaryValueCallBacks as *const u8 as *const c_void,
         );
-        let trusted = AXIsProcessTrustedWithOptions(dict as *const c_void);
+        let trusted = AXIsProcessTrustedWithOptions(dict);
         if !dict.is_null() {
             CFRelease(dict as *mut c_void);
         }
@@ -935,7 +937,7 @@ fn spawn_llm(app: tauri::AppHandle, prompt: String, original_text: Option<String
                     set_status(&app, "✨");
                 } else {
                     let state = app.state::<AppState>();
-                    push_undo(&state, &read_clipboard(&app));
+                    push_undo(&state.undo_stack, &read_clipboard(&app));
                     match write_clipboard(&app, &text) {
                         Ok(()) => {
                             let _ = app.emit("llm-done", &text);
@@ -1461,7 +1463,7 @@ fn set_hotkey(app: tauri::AppHandle, hotkey: String) -> Result<(), String> {
 fn accept_preview(app: tauri::AppHandle, text: String) -> Result<(), String> {
     hide_preview_window(&app);
     let state = app.state::<AppState>();
-    push_undo(&state, &read_clipboard(&app));
+    push_undo(&state.undo_stack, &read_clipboard(&app));
     write_clipboard(&app, &text)?;
     let _ = app.emit("llm-done", &text);
     set_status(&app, "✓");
@@ -1542,5 +1544,32 @@ mod hotkey_tests {
     fn key_must_be_present() {
         assert_eq!(normalize_hotkey("Ctrl+Shift"), "");
         assert_eq!(normalize_hotkey(""), "");
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::{push_undo, UNDO_LIMIT};
+    use std::sync::Mutex;
+
+    #[test]
+    fn dedupes_consecutive_entries() {
+        let stack = Mutex::new(Vec::new());
+        push_undo(&stack, "a");
+        push_undo(&stack, "a");
+        push_undo(&stack, "b");
+        assert_eq!(stack.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn caps_at_limit_keeping_newest() {
+        let stack = Mutex::new(Vec::new());
+        for i in 0..(UNDO_LIMIT + 5) {
+            push_undo(&stack, &format!("v{i}"));
+        }
+        let s = stack.lock().unwrap();
+        assert_eq!(s.len(), UNDO_LIMIT);
+        assert_eq!(s[0], format!("v5")); // the five oldest were dropped
+        assert_eq!(s[s.len() - 1], format!("v{}", UNDO_LIMIT + 4));
     }
 }

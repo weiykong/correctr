@@ -115,13 +115,12 @@ pub fn http_error(provider: &str, status: u16, body: &str) -> String {
         .and_then(|v| {
             let msg = v
                 .get("error")
-                .map(|e| {
+                .and_then(|e| {
                     e.get("message")
                         .and_then(|m| m.as_str())
                         .map(String::from)
                         .or_else(|| e.as_str().map(String::from))
                 })
-                .flatten()
                 .or_else(|| v.get("message").and_then(|m| m.as_str()).map(String::from));
             msg
         })

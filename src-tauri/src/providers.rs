@@ -133,6 +133,51 @@ pub fn http_error(provider: &str, status: u16, body: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_think_blocks_closed() {
+        assert_eq!(strip_think_blocks("<think>plan
+</think>
+
+Result"), "Result");
+    }
+
+    #[test]
+    fn strip_think_blocks_unclosed_drops_tail() {
+        let streamed = "Result\n\n".to_owned() + "<think>" + "\nhalf-streamed";
+        assert_eq!(strip_think_blocks(&streamed), "Result");
+    }
+
+    #[test]
+    fn http_error_parses_openai_shape() {
+        let e = http_error("openai", 429, r#"{"error":{"message":"rate limited"}}"#);
+        assert_eq!(e, "openai HTTP 429: rate limited");
+    }
+
+    #[test]
+    fn http_error_string_error_shape() {
+        let e = http_error("anthropic", 401, r#"{"error":"invalid key"}"#);
+        assert_eq!(e, "anthropic HTTP 401: invalid key");
+    }
+
+    #[test]
+    fn http_error_non_json_body_truncates() {
+        let e = http_error("gemini", 500, "Internal Server Error");
+        assert_eq!(e, "gemini HTTP 500: Internal Server Error");
+    }
+
+    #[test]
+    fn provider_lookup() {
+        assert_eq!(find_provider("openai").map(|p| p.kind), Some(Kind::OpenAi));
+        assert_eq!(find_provider("anthropic").map(|p| p.kind), Some(Kind::Anthropic));
+        assert!(find_provider("ollama").is_none()); // not a preset; custom providers cover it
+        assert!(find_provider("nope").is_none());
+    }
+}
+
 #[allow(dead_code)]
 pub async fn generate(resolved: &Resolved, prompt: &str) -> Result<String, String> {
     generate_stream(resolved, prompt, |_| {}).await

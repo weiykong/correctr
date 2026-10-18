@@ -64,11 +64,17 @@ pub fn run() {
             // without it registration can succeed but never fire. We check
             // that up front and guide the user from the tray.
             let h = app.handle().clone();
-            let hotkey_res = app.global_shortcut().on_shortcut("ctrl+cmd+c", move |_app, _sc, event| {
-                if event.state() == ShortcutState::Pressed {
-                    hotkey_correct(h.clone());
-                }
-            });
+            // Register from config, not a hardcoded default — a combo saved in
+            // Settings must survive a restart.
+            let initial_hotkey = normalize_hotkey(&app.state::<AppState>().config.lock().unwrap().hotkey);
+            let hotkey_res = app.global_shortcut().on_shortcut(
+                if initial_hotkey.is_empty() { "ctrl+cmd+c" } else { initial_hotkey.as_str() },
+                move |_app, _sc, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        hotkey_correct(h.clone());
+                    }
+                },
+            );
             if let Err(e) = hotkey_res {
                 log::error!("hotkey registration failed: {e}");
                 set_status(&handle, "✗ hotkey");
@@ -1397,36 +1403,58 @@ fn get_hotkey(state: State<'_, AppState>) -> String {
     state.config.lock().unwrap().hotkey.clone()
 }
 
+/// Canonical form for the global-shortcut plugin: `ctrl+cmd+c` — modifiers
+/// first, the key last. Returns empty when no key is present.
+fn normalize_hotkey(hotkey: &str) -> String {
+    let mut mods = Vec::new();
+    let mut key = String::new();
+    for raw in hotkey.split('+') {
+        let p = raw.trim().to_lowercase();
+        if p.is_empty() {
+            continue;
+        }
+        match p.as_str() {
+            "ctrl" | "control" => mods.push("ctrl"),
+            "cmd" | "command" | "meta" => mods.push("cmd"),
+            "alt" | "option" => mods.push("alt"),
+            "shift" => mods.push("shift"),
+            _ => key = p,
+        }
+    }
+    if key.is_empty() {
+        return String::new();
+    }
+    mods.push(key.as_str());
+    mods.join("+")
+}
+
 #[tauri::command]
 fn set_hotkey(app: tauri::AppHandle, hotkey: String) -> Result<(), String> {
     let state = app.state::<AppState>();
-    {
+    let old = {
         let mut cfg = state.config.lock().unwrap();
+        let old = cfg.hotkey.clone();
         cfg.hotkey = hotkey.clone();
-        let snapshot = cfg.clone();
-        config::save(&snapshot).map_err(|e| e.to_string())?;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+        old
+    };
+    let shortcut = normalize_hotkey(&hotkey);
+    if shortcut.is_empty() {
+        return Err("Hotkey must include a key (e.g. Ctrl+Cmd+C)".into());
     }
-    // Re-register with the new combo (only the default combo is supported today).
-    let accel = hotkey
-        .split('+')
-        .filter_map(|p| match p.trim().to_lowercase().as_str() {
-            "ctrl" | "control" => Some("ctrl"),
-            "cmd" | "command" | "meta" => Some("cmd"),
-            "alt" | "option" => Some("alt"),
-            "shift" => Some("shift"),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("+");
-    let shortcut = format!("{accel}+c");
+    let gs = app.global_shortcut();
+    let old_norm = normalize_hotkey(&old);
+    if !old_norm.is_empty() && old_norm != shortcut {
+        // Drop the old combo so two hotkeys don't both fire.
+        let _ = gs.unregister(old_norm.as_str());
+    }
     let app_h = app.clone();
-    app.global_shortcut()
-        .on_shortcut(shortcut.as_str(), move |_a, _s, ev| {
-            if ev.state() == ShortcutState::Pressed {
-                hotkey_correct(app_h.clone());
-            }
-        })
-        .map_err(|e| e.to_string())
+    gs.on_shortcut(shortcut.as_str(), move |_a, _s, ev| {
+        if ev.state() == ShortcutState::Pressed {
+            hotkey_correct(app_h.clone());
+        }
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1496,5 +1524,23 @@ mod pasteboard_tests {
             let _ = pasteboard::set_text(&o);
             assert_eq!(pasteboard::get_text().as_deref(), Some(o.as_str()));
         }
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::normalize_hotkey;
+
+    #[test]
+    fn canonicalizes_modifiers_then_key() {
+        assert_eq!(normalize_hotkey("Ctrl+Cmd+C"), "ctrl+cmd+c");
+        assert_eq!(normalize_hotkey("  Control + Command + X "), "ctrl+cmd+x");
+        assert_eq!(normalize_hotkey("Cmd+Shift+Z"), "cmd+shift+z");
+    }
+
+    #[test]
+    fn key_must_be_present() {
+        assert_eq!(normalize_hotkey("Ctrl+Shift"), "");
+        assert_eq!(normalize_hotkey(""), "");
     }
 }

@@ -189,3 +189,39 @@ pub fn slugify(name: &str) -> String {
         trimmed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(slugify("My Gateway"), "my-gateway");
+        assert_eq!(slugify("  LM Studio!! "), "lm-studio");
+        assert_eq!(slugify("!!!"), "custom");
+    }
+
+    #[test]
+    fn fill_template_basic() {
+        assert_eq!(fill_template("Fix:\n{text}", "helo"), "Fix:\nhelo");
+    }
+
+    #[test]
+    fn config_roundtrip() {
+        let cfg = Config::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provider, cfg.provider);
+        assert_eq!(back.hotkey, cfg.hotkey);
+        assert_eq!(back.languages, cfg.languages);
+        assert_eq!(back.skills.len(), cfg.skills.len());
+    }
+
+    #[test]
+    fn partial_json_falls_back_to_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"provider":"gemini"}"#).unwrap();
+        assert_eq!(cfg.provider, "gemini");
+        assert_eq!(cfg.languages, default_languages());
+        assert!(cfg.preview_before_replace);
+    }
+}

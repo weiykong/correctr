@@ -101,3 +101,51 @@ pub fn add_custom_provider(
     cfg.custom_providers.push(provider.clone());
     provider
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_provider_is_resolved_as_openai_compatible() {
+        let mut cfg = Config::default();
+        let p = add_custom_provider(&mut cfg, "My Gateway".into(), "https://gw.example/v1/".into(), "k1".into(), "m1".into());
+        assert_eq!(p.id, "my-gateway");
+        assert_eq!(p.base_url, "https://gw.example/v1");
+        cfg.provider = p.id.clone();
+        let r = resolve(&cfg);
+        assert_eq!(r.kind, Kind::OpenAi);
+        assert_eq!(r.api_key, "k1");
+        assert_eq!(r.model, "m1");
+    }
+
+    #[test]
+    fn duplicate_custom_names_get_unique_ids() {
+        let mut cfg = Config::default();
+        let a = add_custom_provider(&mut cfg, "Local".into(), "http://x".into(), "k".into(), "m".into());
+        let b = add_custom_provider(&mut cfg, "Local".into(), "http://y".into(), "k".into(), "m".into());
+        assert_eq!(a.id, "local");
+        assert_eq!(b.id, "local-2");
+    }
+
+    #[test]
+    fn preset_uses_configured_key_and_default_model() {
+        let mut cfg = Config::default();
+        cfg.provider = "anthropic".into();
+        cfg.api_keys.insert("anthropic".into(), "sk-ant".into());
+        let r = resolve(&cfg);
+        assert_eq!(r.kind, Kind::Anthropic);
+        assert_eq!(r.api_key, "sk-ant");
+        assert_eq!(r.model, "claude-sonnet-4-5"); // empty per-provider model -> default
+        cfg.anthropic_model = "claude-haiku-4-5".into();
+        assert_eq!(resolve(&cfg).model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn prompts_embed_text_and_language() {
+        assert!(correct_prompt("helo world").contains("helo world"));
+        let p = translate_prompt("bonjour", "English");
+        assert!(p.contains("English"));
+        assert!(p.contains("bonjour"));
+    }
+}
